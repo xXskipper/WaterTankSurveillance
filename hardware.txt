@@ -1,0 +1,70 @@
+Bill of Materials – Water Tank Surveillance System
+===================================================
+
+2x  Heltec WiFi LoRa 32 V4
+      Chip      : ESP32-S3R2
+      LoRa chip : SX1262
+      Display   : 0.96" OLED (SSD1306, 128x64, I2C)
+      Frequency : 868 MHz (EU)
+      URL       : https://heltec.org/project/wifi-lora-32-v4/
+
+2x  AZDelivery Polysilicon Mini Solar Panel
+      Voltage : 5 V
+      Power   : 1.5 W
+      Notes   : Waterproof resin encapsulated
+
+2x  3.7 V 3000 mAh LiPo Battery
+      Connector : JST 1.25
+      Protection: Built-in PCB
+      Compatible with Heltec LoRa 32 JST connector
+
+1x  ARCELI JSN-SR04T Waterproof Ultrasonic Distance Sensor
+      Range    : 20 – 600 cm
+      VCC      : 5 V
+      Trigger  : 10 µs pulse on TRIG pin
+      Echo     : HIGH pulse proportional to distance
+      Notes    : IP67 suitable for outdoor/wet environments
+
+===================================================
+Pin Mapping – Heltec WiFi LoRa 32 V4 (ESP32-S3)
+===================================================
+
+LoRa (SX1262):
+  SCK   → GPIO 9
+  MISO  → GPIO 11
+  MOSI  → GPIO 10
+  CS    → GPIO 8
+  RST   → GPIO 12
+  DIO1  → GPIO 14
+  BUSY  → GPIO 13
+
+OLED (SSD1306, I2C):
+  SDA   → GPIO 17
+  SCL   → GPIO 18
+  RST   → GPIO 21
+  Addr  → 0x3C
+
+Sensor (JSN-SR04T) – Sender board only:
+  TRIG  → GPIO 4
+  ECHO  → GPIO 5
+
+Button (PRG/BOOT):
+  Pin   → GPIO 0  (active LOW)
+  Use   → Triggers manual display readout + link check on sender
+
+===================================================
+Library Dependencies
+===================================================
+
+Both sketches:
+  - RadioLib        (by jgromes)     – SX1262 LoRa driver
+  - Adafruit SSD1306 (by Adafruit)   – OLED display
+  - Adafruit GFX Library (by Adafruit)
+
+Receiver only:
+  - ReadyMail (by Mobizt)            – SMTP email via Gmail
+  
+===================================================
+Update
+===================================================
+To be able to connect the device the upper button needs to be held, to wake it up from deep sleep
