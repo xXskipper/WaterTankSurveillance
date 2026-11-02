@@ -20,6 +20,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RadioLib.h>
+#include <algorithm>
 
 // --- Heltec WiFi LoRa 32 V4 (ESP32-S3) – LoRa Pins ---
 #define LORA_SCK    9
@@ -49,11 +50,13 @@
 #define ECHO_PIN    5
 
 // --- Tank Parameters (ADJUST to your tank!) ---
-#define TANK_HEIGHT_CM    300   // Inner height of the tank in cm
-#define SENSOR_OFFSET_CM   10   // Gap from sensor face to the top of the tank in cm
+// Measured: 146 cm floor → lid, sensor sits in a 5 cm box mounted under the lid
+//   → sensor face is 141 cm above the floor; 100 % leaves 2 cm of air below it.
+#define TANK_HEIGHT_CM    139   // Usable water height (floor → 100 % level) in cm
+#define SENSOR_OFFSET_CM    2   // Gap from sensor face to the 100 % level in cm
 
 // --- Deep Sleep Interval ---
-#define SLEEP_MINUTES      10
+#define SLEEP_MINUTES     360   // 6 h
 #define US_PER_MINUTE      60000000ULL
 #define SLEEP_DURATION     (SLEEP_MINUTES * US_PER_MINUTE)
 
@@ -61,10 +64,26 @@
 #define NUM_MEASUREMENTS   10
 
 // Valid sensor range – readings outside this window are rejected as noise.
-// Min: sensor can't be closer than a few cm to the mount point.
+// Min: the JSN-SR04T never reports less than ~20 cm, even in its blind zone –
+//      anything below this is a noise spike on the echo pin (e.g. no sensor).
 // Max: a little beyond "tank fully empty" (height + offset + margin).
-#define SENSOR_MIN_CM  (SENSOR_OFFSET_CM - 5)
+#define SENSOR_MIN_CM  10
 #define SENSOR_MAX_CM  (TANK_HEIGHT_CM + SENSOR_OFFSET_CM + 15)
+
+// Blind zone: the JSN-SR04T is unreliable closer than this → report "tank full".
+#define SENSOR_BLIND_CM    25
+// Spread check: shots further than SPREAD_TOL_CM from the median are outliers.
+// If fewer than MIN_AGREE shots agree, the reading is reported as unstable
+// (typical for multi-echoes when the water is too close to the sensor).
+#define SPREAD_TOL_CM       3
+#define MIN_AGREE           7
+
+// --- Special LoRa payload codes (must match the receiver) ---
+#define CODE_UNSTABLE     253
+#define CODE_TANK_FULL    254
+#define CODE_SENSOR_ERROR 255
+
+enum MeasureResult { MEAS_OK, MEAS_NO_ECHO, MEAS_BLIND, MEAS_UNSTABLE };
 
 // --- ACK wait after button wakeup ---
 #define ACK_TIMEOUT_MS     3000
@@ -130,10 +149,10 @@ bool initOLED() {
 
 // Renders one consistent layout to the OLED and pushes it.
 //   fillLevel  : -1 = not yet measured, 0-100 = measured value
-//   sensorError: true → shows "Sensor ERROR!" instead of fill level
+//   errorText  : non-null → shown large instead of fill level (e.g. "Sen ERR!")
 //   status     : short string on the bottom line
 //   battV      : battery voltage (V); <0 = omit battery row
-void updateDisplay(int fillLevel, bool sensorError, const char* status, float battV = -1.0f) {
+void updateDisplay(int fillLevel, const char* errorText, const char* status, float battV = -1.0f) {
     if (!oledReady) return;
 
     display.clearDisplay();
@@ -145,10 +164,10 @@ void updateDisplay(int fillLevel, bool sensorError, const char* status, float ba
     display.print("Tank Sender");
     display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
-    if (sensorError) {
+    if (errorText) {
         display.setTextSize(2);
         display.setCursor(10, 18);
-        display.print("Sen ERR!");
+        display.print(errorText);
     } else if (fillLevel < 0) {
         // Not yet measured – just show a waiting message
         display.setTextSize(1);
@@ -205,8 +224,10 @@ static long echoMicros() {
     return (long)(micros() - t1);
 }
 
-float measureDistance() {
-    float sum = 0;
+// Fires NUM_MEASUREMENTS shots, rejects outliers around the median and
+// writes the averaged distance to distanceCm (only valid for MEAS_OK).
+MeasureResult measureDistance(float &distanceCm) {
+    float readings[NUM_MEASUREMENTS];
     int valid = 0;
     for (int i = 0; i < NUM_MEASUREMENTS; i++) {
         digitalWrite(TRIG_PIN, LOW);
@@ -221,8 +242,7 @@ float measureDistance() {
             float d = duration * 0.034f / 2.0f;
             if (d >= SENSOR_MIN_CM && d <= SENSOR_MAX_CM) {
                 Serial.printf(" %ld us -> %.1f cm OK", duration, d);
-                sum += d;
-                valid++;
+                readings[valid++] = d;
             } else {
                 Serial.printf(" %ld us -> %.1f cm OUT OF RANGE", duration, d);
             }
@@ -230,9 +250,32 @@ float measureDistance() {
         Serial.println();
         delay(60);
     }
-    Serial.printf("  [sensor] valid=%d/%d  avg=%.1f cm\n",
-                  valid, NUM_MEASUREMENTS, valid > 0 ? sum / valid : 0.0f);
-    return (valid == 0) ? -1.0f : (sum / valid);
+    if (valid == 0) {
+        Serial.printf("  [sensor] valid=0/%d\n", NUM_MEASUREMENTS);
+        return MEAS_NO_ECHO;
+    }
+
+    // Median is robust against single outliers
+    std::sort(readings, readings + valid);
+    float median = (valid % 2) ? readings[valid / 2]
+                               : (readings[valid / 2 - 1] + readings[valid / 2]) / 2.0f;
+
+    // Average only the shots that agree with the median
+    float sum = 0;
+    int agree = 0;
+    for (int i = 0; i < valid; i++) {
+        if (fabsf(readings[i] - median) <= SPREAD_TOL_CM) {
+            sum += readings[i];
+            agree++;
+        }
+    }
+    Serial.printf("  [sensor] valid=%d/%d  median=%.1f cm  agree=%d  spread=%.1f cm\n",
+                  valid, NUM_MEASUREMENTS, median, agree, readings[valid - 1] - readings[0]);
+
+    if (median < SENSOR_BLIND_CM) return MEAS_BLIND;
+    if (agree < MIN_AGREE)        return MEAS_UNSTABLE;
+    distanceCm = sum / agree;
+    return MEAS_OK;
 }
 
 int calcFillLevel(float distanceCm) {
@@ -294,27 +337,44 @@ void setup() {
     // OLED only on button press
     if (buttonWakeup) {
         initOLED();
-        updateDisplay(-1, false, "Booting...");
+        updateDisplay(-1, nullptr, "Booting...");
     }
 
     // ── Measure ─────────────────────────────────────────────────────────
-    if (buttonWakeup) updateDisplay(-1, false, "Measuring...");
+    if (buttonWakeup) updateDisplay(-1, nullptr, "Measuring...");
     pinMode(TRIG_PIN, OUTPUT);
     digitalWrite(TRIG_PIN, LOW);
     pinMode(ECHO_PIN, INPUT_PULLDOWN);
     delay(200);
 
-    float distance   = measureDistance();
-    bool sensorError = (distance < 0);
-    int  fillLevel   = sensorError ? 0 : calcFillLevel(distance);
+    float         distance  = 0;
+    MeasureResult meas      = measureDistance(distance);
+    int           fillLevel = 0;
+    int           payload   = CODE_SENSOR_ERROR;
+    const char*   errorText = nullptr;
 
-    if (sensorError) {
-        Serial.println("ERROR: No valid sensor reading.");
-        if (buttonWakeup) updateDisplay(0, true, "Transmitting...");
-    } else {
-        Serial.printf("Distance: %.1f cm  |  Fill: %d%%\n", distance, fillLevel);
-        if (buttonWakeup) updateDisplay(fillLevel, false, "Transmitting...");
+    switch (meas) {
+        case MEAS_OK:
+            fillLevel = calcFillLevel(distance);
+            payload   = fillLevel;
+            Serial.printf("Distance: %.1f cm  |  Fill: %d%%\n", distance, fillLevel);
+            break;
+        case MEAS_BLIND:
+            payload   = CODE_TANK_FULL;
+            errorText = "FULL!";
+            Serial.println("Water within sensor blind zone – reporting FULL.");
+            break;
+        case MEAS_UNSTABLE:
+            payload   = CODE_UNSTABLE;
+            errorText = "Unstable";
+            Serial.println("Readings scatter too much – reporting UNSTABLE.");
+            break;
+        case MEAS_NO_ECHO:
+            errorText = "Sen ERR!";
+            Serial.println("ERROR: No valid sensor reading.");
+            break;
     }
+    if (buttonWakeup) updateDisplay(fillLevel, errorText, "Transmitting...");
 
     // ── LoRa ─────────────────────────────────────────────────────────────
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
@@ -327,13 +387,13 @@ void setup() {
     const char* finalStatus = "LoRa init failed!";
 
     if (loraOk) {
-        String payload = sensorError ? "255" : String(fillLevel);
-        txOk        = (radio.transmit(payload) == RADIOLIB_ERR_NONE);
+        String msg  = String(payload);
+        txOk        = (radio.transmit(msg) == RADIOLIB_ERR_NONE);
         finalStatus = txOk ? "Transmitted OK" : "Transmit failed!";
         Serial.println(finalStatus);
 
-        if (txOk && buttonWakeup && !sensorError) {
-            updateDisplay(fillLevel, false, "Checking link...");
+        if (txOk && buttonWakeup && meas != MEAS_NO_ECHO) {
+            updateDisplay(fillLevel, errorText, "Checking link...");
             linked      = waitForAck();
             finalStatus = linked ? "Link: OK" : "Link: No signal";
             Serial.printf("Link: %s\n", linked ? "OK" : "No signal");
@@ -346,7 +406,7 @@ void setup() {
     // ── Final result on OLED (button only) ───────────────────────────────
     if (buttonWakeup) {
         float battV = readBatteryVoltage();
-        updateDisplay(sensorError ? 0 : fillLevel, sensorError, finalStatus, battV);
+        updateDisplay(fillLevel, errorText, finalStatus, battV);
         delay(5000);
         display.ssd1306_command(SSD1306_DISPLAYOFF);
     }
