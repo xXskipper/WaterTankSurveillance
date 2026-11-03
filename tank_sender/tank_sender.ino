@@ -50,13 +50,11 @@
 #define ECHO_PIN    5
 
 // --- Tank Parameters (ADJUST to your tank!) ---
-// Measured: 146 cm floor → lid, sensor sits in a 5 cm box mounted under the lid
-//   → sensor face is 141 cm above the floor; 100 % leaves 2 cm of air below it.
-#define TANK_HEIGHT_CM    139   // Usable water height (floor → 100 % level) in cm
-#define SENSOR_OFFSET_CM    2   // Gap from sensor face to the 100 % level in cm
+#define TANK_HEIGHT_CM    116   // Usable water height (floor → 100 % level) in cm
+#define SENSOR_OFFSET_CM    25   // Gap from sensor face to the 100 % level in cm
 
 // --- Deep Sleep Interval ---
-#define SLEEP_MINUTES     360   // 6 h
+#define SLEEP_MINUTES      30   // 30 min
 #define US_PER_MINUTE      60000000ULL
 #define SLEEP_DURATION     (SLEEP_MINUTES * US_PER_MINUTE)
 

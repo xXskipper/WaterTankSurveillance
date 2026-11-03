@@ -68,6 +68,7 @@
 // --- Alarm thresholds (ADJUST!) ---
 #define ALARM_LEVEL    20   // Send email when fill level drops below 20 %
 #define RESET_LEVEL    35   // Clear the alarm flag once level rises above 35 %
+#define FULL_REARM_LEVEL 85 // Re-arm the "tank full" mail once level drops below 85 %
 
 // --- Special LoRa payload codes (must match the sender) ---
 #define CODE_UNSTABLE     253   // Readings scattered too much – ignored
@@ -82,6 +83,7 @@
 //  State that must survive deep sleep → RTC memory
 // ============================================
 RTC_DATA_ATTR bool     alarmSent   = false;
+RTC_DATA_ATTR bool     fullSent    = false;
 RTC_DATA_ATTR int      lastFill    = -1;   // -1 = no packet received yet
 RTC_DATA_ATTR int      lastRssi    = 0;
 RTC_DATA_ATTR uint32_t packetCount = 0;
@@ -266,6 +268,13 @@ void sendAlertEmail(int fillLevel) {
     sendEmail("Water tank needs refilling!", body);
 }
 
+void sendFullEmail() {
+    String body  = "Hello,\r\n\r\n";
+    body += "The water tank is full again.\r\n\r\n";
+    body += "-- Water Tank Monitor --";
+    sendEmail("Water tank is full", body);
+}
+
 bool sendTestEmail() {
     String body  = "Hello,\r\n\r\n";
     body += "This is a test email from the Water Tank Monitor.\r\n";
@@ -357,6 +366,18 @@ void handleLoRaWakeup() {
             if (fillLevel >= RESET_LEVEL && alarmSent) {
                 alarmSent = false;
                 Serial.println("Alarm cleared – tank refilled.");
+            }
+
+            if (fillLevel < FULL_REARM_LEVEL && fullSent) {
+                fullSent = false;
+            }
+
+            if (fillLevel == CODE_TANK_FULL && !fullSent) {
+                Serial.println("Tank full! Sending email...");
+                connectWiFi();
+                sendFullEmail();
+                WiFi.disconnect(true);
+                fullSent = true;
             }
 
             if (fillLevel <= ALARM_LEVEL && !alarmSent) {
