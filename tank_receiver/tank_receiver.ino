@@ -24,15 +24,31 @@
 //        Full init → startup screen → sleep.
 // ============================================
 
+// ============================================
+//  FEATURE FLAGS  (1 = on, 0 = off)
+// ============================================
+#define FEATURE_EMAIL        1   // Master switch: 0 = no WiFi, no ReadyMail, no mails at all
+#define FEATURE_EMAIL_LOW    1   // Mail when the tank is (almost) empty
+#define FEATURE_EMAIL_FULL   1   // Mail once when the tank is full
+#define FEATURE_EMAIL_TEST   0   // Test mail on long button press
+#define FEATURE_EMAIL_VALVE  0   // Mails when the valve opens / the tank is filled / the time limit hits
+
+#define EMAIL_VALVE_ON (FEATURE_EMAIL && FEATURE_EMAIL_VALVE)
+#define EMAIL_LOW_ON   (FEATURE_EMAIL && FEATURE_EMAIL_LOW)
+#define EMAIL_FULL_ON  (FEATURE_EMAIL && FEATURE_EMAIL_FULL)
+#define EMAIL_TEST_ON  (FEATURE_EMAIL && FEATURE_EMAIL_TEST)
+
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RadioLib.h>
 #include <WiFi.h>
+#if FEATURE_EMAIL
 #include <WiFiClientSecure.h>
 #define ENABLE_SMTP
 #include <ReadyMail.h>
+#endif
 #include "driver/rtc_io.h"
 
 // --- Heltec WiFi LoRa 32 V4 (ESP32-S3) – LoRa Pins ---
@@ -86,6 +102,8 @@ RTC_DATA_ATTR bool     alarmSent   = false;
 RTC_DATA_ATTR bool     fullSent    = false;
 RTC_DATA_ATTR int      lastFill    = -1;   // -1 = no packet received yet
 RTC_DATA_ATTR int      lastRssi    = 0;
+RTC_DATA_ATTR float    lastPressure = -2.0f;   // -2 = sender sends no pressure, -1 = sensor fault
+RTC_DATA_ATTR int      lastValve   = -1;       // -1 = unknown, 0 = closed, 1 = open, 2 = locked
 RTC_DATA_ATTR uint32_t packetCount = 0;
 
 // ============================================
@@ -93,12 +111,14 @@ RTC_DATA_ATTR uint32_t packetCount = 0;
 SPIClass loraSPI(FSPI);
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RST);
+#if FEATURE_EMAIL
 WiFiClientSecure ssl_client;
 
 // Called by ReadyMail after the STARTTLS command to upgrade the connection
 void tlsHandshake(bool &success) { success = ssl_client.startTLS(); }
 
 SMTPClient smtp(ssl_client, tlsHandshake, SMTP_STARTTLS);
+#endif
 
 bool oledReady = false;
 
@@ -159,6 +179,14 @@ void updateDisplay(const char* status, float battV = -1.0f) {
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.print("Tank Receiver");
+    if (lastValve >= 0) {
+        char pv[12];
+        if (lastPressure >= 0) snprintf(pv, sizeof(pv), "%.1fb", lastPressure);
+        else                   snprintf(pv, sizeof(pv), "--b");
+        display.setCursor(84, 0);
+        display.print(pv);
+        display.print(lastValve == 1 ? " ON" : (lastValve == 2 ? " ERR" : ""));
+    }
     display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
     if (lastFill < 0) {
@@ -218,6 +246,9 @@ void updateDisplay(const char* status, float battV = -1.0f) {
 // ============================================
 
 void connectWiFi() {
+#if !FEATURE_EMAIL
+    return;   // WiFi is only needed for mails
+#endif
     if (strlen(WIFI_PASSWORD) > 0) {
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     } else {
@@ -230,6 +261,7 @@ void connectWiFi() {
     }
 }
 
+#if FEATURE_EMAIL
 void smtpCallback(SMTPStatus status) {
     Serial.println(status.text);
 }
@@ -275,6 +307,27 @@ void sendFullEmail() {
     sendEmail("Water tank is full", body);
 }
 
+void sendValveEmail(int valve, int fillLevel, float pressure) {
+    String subject, intro;
+    if (valve == 1) {
+        subject = "Water tank: refilling started";
+        intro   = "The valve was opened, the tank is being refilled.";
+    } else if (valve == 2) {
+        subject = "Water tank: refill TIME LIMIT reached!";
+        intro   = "The valve was closed after the safety time limit and is locked.\r\n"
+                  "Please check the water line and the level sensor.";
+    } else {
+        subject = "Water tank: refilling finished";
+        intro   = "The valve was closed.";
+    }
+    String body  = "Hello,\r\n\r\n" + intro + "\r\n\r\n";
+    if (fillLevel == CODE_TANK_FULL) body += "Fill level : FULL\r\n";
+    else                             body += "Fill level : " + String(fillLevel) + " %\r\n";
+    if (pressure >= 0) body += "Pressure   : " + String(pressure, 1) + " bar\r\n";
+    body += "\r\n-- Water Tank Monitor --";
+    sendEmail(subject, body);
+}
+
 bool sendTestEmail() {
     String body  = "Hello,\r\n\r\n";
     body += "This is a test email from the Water Tank Monitor.\r\n";
@@ -291,6 +344,7 @@ bool sendTestEmail() {
     body += "-- Water Tank Monitor --";
     return sendEmail("Water tank monitor: test email", body);
 }
+#endif   // FEATURE_EMAIL
 
 // ============================================
 //  LoRa helpers
@@ -363,6 +417,27 @@ void handleLoRaWakeup() {
             lastFill = fillLevel;
             lastRssi = rssi;
 
+            // Optional extension from the sender: "level;pressure;valve"
+            int newValve = -1;
+            int sep1 = received.indexOf(';');
+            int sep2 = received.indexOf(';', sep1 + 1);
+            if (sep1 > 0 && sep2 > sep1) {
+                lastPressure = received.substring(sep1 + 1, sep2).toFloat();
+                newValve     = received.substring(sep2 + 1).toInt();
+                Serial.printf("Pressure: %.1f bar  Valve: %d\n", lastPressure, newValve);
+            }
+
+#if EMAIL_VALVE_ON
+            // Mail on valve state changes only; the very first report just sets the state
+            if (newValve >= 0 && lastValve >= 0 && newValve != lastValve) {
+                Serial.println("Valve state changed – sending email...");
+                connectWiFi();
+                sendValveEmail(newValve, fillLevel, lastPressure);
+                WiFi.disconnect(true);
+            }
+#endif
+            if (newValve >= 0) lastValve = newValve;
+
             if (fillLevel >= RESET_LEVEL && alarmSent) {
                 alarmSent = false;
                 Serial.println("Alarm cleared – tank refilled.");
@@ -372,6 +447,7 @@ void handleLoRaWakeup() {
                 fullSent = false;
             }
 
+#if EMAIL_FULL_ON
             if (fillLevel == CODE_TANK_FULL && !fullSent) {
                 Serial.println("Tank full! Sending email...");
                 connectWiFi();
@@ -379,7 +455,9 @@ void handleLoRaWakeup() {
                 WiFi.disconnect(true);
                 fullSent = true;
             }
+#endif
 
+#if EMAIL_LOW_ON
             if (fillLevel <= ALARM_LEVEL && !alarmSent) {
                 Serial.println("Fill level critical! Sending email...");
                 connectWiFi();
@@ -387,6 +465,7 @@ void handleLoRaWakeup() {
                 WiFi.disconnect(true);
                 alarmSent = true;
             }
+#endif
         }
     } else {
         Serial.printf("LoRa read error: %d\n", rxState);
@@ -409,12 +488,15 @@ void handleButtonWakeup() {
     // GPIO 0 is still an RTC pin after the EXT0 wakeup – hand it back to GPIO.
     rtc_gpio_deinit(GPIO_NUM_0);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+    bool longPress = false;
+#if EMAIL_TEST_ON
     updateDisplay("Hold 3s: test mail");
     unsigned long pressStart = millis();
     while (digitalRead(BUTTON_PIN) == LOW && (millis() - pressStart) < LONG_PRESS_MS) {
         delay(20);
     }
-    bool longPress = (digitalRead(BUTTON_PIN) == LOW);
+    longPress = (digitalRead(BUTTON_PIN) == LOW);
+#endif
     Serial.println(longPress ? "Long press – test email." : "Short press.");
 
     updateDisplay("WiFi: connecting...");
@@ -427,7 +509,9 @@ void handleButtonWakeup() {
     connectWiFi();
 
     char wifiLine[22];
-    if (WiFi.status() == WL_CONNECTED) {
+    if (!FEATURE_EMAIL) {
+        snprintf(wifiLine, sizeof(wifiLine), "Email: disabled");
+    } else if (WiFi.status() == WL_CONNECTED) {
         snprintf(wifiLine, sizeof(wifiLine), "WiFi: %s",
                  WiFi.localIP().toString().c_str());
     } else {
@@ -435,6 +519,7 @@ void handleButtonWakeup() {
     }
     updateDisplay(wifiLine, battV);
 
+#if EMAIL_TEST_ON
     if (longPress) {
         if (WiFi.status() == WL_CONNECTED) {
             updateDisplay("Sending test mail...", battV);
@@ -445,6 +530,7 @@ void handleButtonWakeup() {
             updateDisplay("Mail: no WiFi!", battV);
         }
     }
+#endif
 
     delay(6000);
     display.ssd1306_command(SSD1306_DISPLAYOFF);
@@ -469,7 +555,10 @@ void handleFirstBoot() {
     connectWiFi();
     
     char statusLine[22];
-    if (WiFi.status() == WL_CONNECTED) {
+    if (!FEATURE_EMAIL) {
+        snprintf(statusLine, sizeof(statusLine), "NoMail  LoRa %s",
+                 loraOk ? "OK" : "FAIL");
+    } else if (WiFi.status() == WL_CONNECTED) {
         snprintf(statusLine, sizeof(statusLine), "WiFi OK  LoRa %s",
                  loraOk ? "OK" : "FAIL");
     } else {

@@ -15,6 +15,16 @@
 //    5. OLED off, deep sleep
 // ============================================
 
+// ============================================
+//  FEATURE FLAGS  (1 = on, 0 = off)
+// ============================================
+#define FEATURE_PRESSURE  0   // Measure water-line pressure and send it with the fill level
+#define FEATURE_VALVE     0   // Open the solenoid valve automatically (needs FEATURE_PRESSURE)
+
+#if FEATURE_VALVE && !FEATURE_PRESSURE
+#error "FEATURE_VALVE needs FEATURE_PRESSURE"
+#endif
+
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -56,7 +66,24 @@
 // --- Deep Sleep Interval ---
 #define SLEEP_MINUTES      30   // 30 min
 #define US_PER_MINUTE      60000000ULL
-#define SLEEP_DURATION     (SLEEP_MINUTES * US_PER_MINUTE)
+
+// --- Pressure sensor (analog transmitter, ADJUST to your sensor!) ---
+#define PRESSURE_ADC_PIN     2      // ADC1 pin (check against the Heltec V4 pinout)
+#define PRESSURE_V_MIN       0.5f   // Sensor output at 0 bar (V)
+#define PRESSURE_V_MAX       4.5f   // Sensor output at full scale (V)
+#define PRESSURE_FULLSCALE   10.0f  // Pressure at PRESSURE_V_MAX (bar)
+#define PRESSURE_DIVIDER     1.5f   // Voltage divider ratio (Vsensor / Vadc), e.g. 10k + 20k = 1.5
+#define PRESSURE_OPEN_BAR    1.0f   // Minimum pressure to OPEN the valve
+#define PRESSURE_KEEP_BAR    0.3f   // Valve closes again when pressure drops below this
+
+// --- Solenoid valve (via MOSFET/relay module, normally closed valve recommended) ---
+#define VALVE_PIN            6      // Output pin (check against the Heltec V4 pinout)
+#define VALVE_ON             HIGH   // Pin level that opens the valve
+#define VALVE_OFF            LOW
+#define VALVE_OPEN_LEVEL     30     // Open when fill level <= this (%)
+#define VALVE_CLOSE_LEVEL    95     // Close when fill level >= this (%) (blind zone always closes)
+#define VALVE_MAX_OPEN_MIN   240    // Safety limit: close after this many minutes (4 h)
+#define FILL_CHECK_MINUTES   10     // Wake interval while the valve is open
 
 // --- Sensor averaging ---
 #define NUM_MEASUREMENTS   10
@@ -89,6 +116,13 @@ enum MeasureResult { MEAS_OK, MEAS_NO_ECHO, MEAS_BLIND, MEAS_UNSTABLE };
 // --- Battery ADC (Heltec V4: 1:2 resistor divider on GPIO 1, enable via GPIO 37) ---
 #define BAT_ADC_PIN   1
 #define BAT_CTRL_PIN  37
+
+// ============================================
+//  State that must survive deep sleep → RTC memory
+// ============================================
+RTC_DATA_ATTR bool     valveOpen    = false;
+RTC_DATA_ATTR bool     valveFault   = false;   // Timeout hit → locked until refilled or button press
+RTC_DATA_ATTR uint32_t valveOpenMin = 0;
 
 // ============================================
 
@@ -281,6 +315,53 @@ int calcFillLevel(float distanceCm) {
     return constrain((int)((waterHeight / TANK_HEIGHT_CM) * 100.0f), 0, 100);
 }
 
+#if FEATURE_PRESSURE
+// Returns the line pressure in bar, or -1 on a sensor fault (e.g. broken wire:
+// output below the sensor's 0 bar level).
+float readPressureBar() {
+    long sum = 0;
+    for (int i = 0; i < 16; i++) {
+        sum += analogReadMilliVolts(PRESSURE_ADC_PIN);
+        delay(2);
+    }
+    float vSensor = (sum / 16.0f / 1000.0f) * PRESSURE_DIVIDER;
+    if (vSensor < PRESSURE_V_MIN - 0.25f) return -1.0f;
+    float bar = (vSensor - PRESSURE_V_MIN) / (PRESSURE_V_MAX - PRESSURE_V_MIN) * PRESSURE_FULLSCALE;
+    return max(bar, 0.0f);
+}
+#endif
+
+#if FEATURE_VALVE
+// Decides whether the valve should be open from now on. Every uncertain case closes it.
+void updateValve(MeasureResult meas, int fillLevel, float pressureBar, bool buttonWakeup) {
+    if (buttonWakeup) valveFault = false;
+    if (meas == MEAS_OK && fillLevel > VALVE_OPEN_LEVEL) valveFault = false;
+
+    if (valveOpen) {
+        valveOpenMin += FILL_CHECK_MINUTES;
+        const char* closeReason = nullptr;
+        if (meas == MEAS_BLIND)                          closeReason = "tank full";
+        else if (meas != MEAS_OK)                        closeReason = "no valid level reading";
+        else if (fillLevel >= VALVE_CLOSE_LEVEL)         closeReason = "level reached";
+        else if (pressureBar < PRESSURE_KEEP_BAR)        closeReason = "pressure lost";
+        else if (valveOpenMin >= VALVE_MAX_OPEN_MIN) {
+            closeReason = "time limit";
+            valveFault  = true;
+        }
+        if (closeReason) {
+            valveOpen = false;
+            Serial.printf("Valve CLOSED: %s (open %u min)\n", closeReason, valveOpenMin);
+        }
+    } else if (!valveFault && meas == MEAS_OK && fillLevel <= VALVE_OPEN_LEVEL
+               && pressureBar >= PRESSURE_OPEN_BAR) {
+        valveOpen    = true;
+        valveOpenMin = 0;
+        Serial.printf("Valve OPENED: level %d%%, pressure %.1f bar\n", fillLevel, pressureBar);
+    }
+    digitalWrite(VALVE_PIN, valveOpen ? VALVE_ON : VALVE_OFF);
+}
+#endif
+
 bool waitForAck() {
     rxFlag = false;
     radio.setDio1Action(setRxFlag);
@@ -309,10 +390,20 @@ void goToSleep() {
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, HIGH);
 
-    Serial.printf("Sleeping for %d minutes...\n", SLEEP_MINUTES);
+    // While the valve is open, wake up often to check the fill level
+    int sleepMinutes = valveOpen ? FILL_CHECK_MINUTES : SLEEP_MINUTES;
+
+#if FEATURE_VALVE
+    // Keep the valve pin at its level during deep sleep
+    digitalWrite(VALVE_PIN, valveOpen ? VALVE_ON : VALVE_OFF);
+    gpio_hold_en((gpio_num_t)VALVE_PIN);
+    gpio_deep_sleep_hold_en();
+#endif
+
+    Serial.printf("Sleeping for %d minutes...\n", sleepMinutes);
     Serial.flush();
 
-    esp_sleep_enable_timer_wakeup(SLEEP_DURATION);
+    esp_sleep_enable_timer_wakeup(sleepMinutes * US_PER_MINUTE);
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
 
     esp_deep_sleep_start();
@@ -326,6 +417,14 @@ void setup() {
     esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
     bool buttonWakeup = (wakeReason == ESP_SLEEP_WAKEUP_EXT0);
     Serial.println(buttonWakeup ? "\n=== Sender: button wakeup ===" : "\n=== Sender: timer wakeup ===");
+
+#if FEATURE_VALVE
+    // Re-apply the valve level first, then release the sleep hold (no glitch)
+    pinMode(VALVE_PIN, OUTPUT);
+    digitalWrite(VALVE_PIN, valveOpen ? VALVE_ON : VALVE_OFF);
+    gpio_hold_dis((gpio_num_t)VALVE_PIN);
+    gpio_deep_sleep_hold_dis();
+#endif
 
     // Vext powers the sensor and OLED from the switched 3.3 V LDO.
     // goToSleep() shuts it off, so the sensor draws nothing during deep sleep.
@@ -372,6 +471,17 @@ void setup() {
             Serial.println("ERROR: No valid sensor reading.");
             break;
     }
+    // ── Pressure & valve ─────────────────────────────────────────────────
+    int valveState = 0;   // 0 = closed, 1 = open, 2 = locked (time limit hit)
+#if FEATURE_PRESSURE
+    float pressureBar = readPressureBar();
+    Serial.printf("Pressure: %.1f bar%s\n", pressureBar, pressureBar < 0 ? " (sensor fault)" : "");
+#endif
+#if FEATURE_VALVE
+    updateValve(meas, fillLevel, pressureBar, buttonWakeup);
+    valveState = valveOpen ? 1 : (valveFault ? 2 : 0);
+#endif
+
     if (buttonWakeup) updateDisplay(fillLevel, errorText, "Transmitting...");
 
     // ── LoRa ─────────────────────────────────────────────────────────────
@@ -386,7 +496,11 @@ void setup() {
 
     if (loraOk) {
         String msg  = String(payload);
-        txOk        = (radio.transmit(msg) == RADIOLIB_ERR_NONE);
+#if FEATURE_PRESSURE
+        // "level;pressure;valve" – the receiver's toInt() still reads the level
+        msg += ";" + String(pressureBar, 1) + ";" + String(valveState);
+#endif
+        txOk       = (radio.transmit(msg) == RADIOLIB_ERR_NONE);
         finalStatus = txOk ? "Transmitted OK" : "Transmit failed!";
         Serial.println(finalStatus);
 
