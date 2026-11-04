@@ -113,9 +113,10 @@ enum MeasureResult { MEAS_OK, MEAS_NO_ECHO, MEAS_BLIND, MEAS_UNSTABLE };
 // --- ACK wait after button wakeup ---
 #define ACK_TIMEOUT_MS     3000
 
-// --- Battery ADC (Heltec V4: 1:2 resistor divider on GPIO 1, enable via GPIO 37) ---
+// --- Battery ADC (Heltec V4: ~390k/100k divider (x4.9) on GPIO 1, enable via GPIO 37) ---
 #define BAT_ADC_PIN   1
 #define BAT_CTRL_PIN  37
+#define BAT_DIVIDER   4.9f   // measured: x2 showed 1.5 V on a charged LiPo
 
 // ============================================
 //  State that must survive deep sleep → RTC memory
@@ -148,7 +149,7 @@ float readBatteryVoltage() {
         delay(5);
     }
     digitalWrite(BAT_CTRL_PIN, LOW);
-    return (sum / 8.0f / 1000.0f) * 2.0f;
+    return (sum / 8.0f / 1000.0f) * BAT_DIVIDER;
 }
 
 int batteryPercent(float v) {
