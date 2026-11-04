@@ -21,6 +21,8 @@
 #define FEATURE_PRESSURE  0   // Measure water-line pressure and send it with the fill level
 #define FEATURE_VALVE     0   // Open the solenoid valve automatically (needs FEATURE_PRESSURE)
 
+#define DEBUG_CONTINUOUS  0   // 1 = measure continuously, print to Serial, never sleep (set 0 for normal operation)
+
 #if FEATURE_VALVE && !FEATURE_PRESSURE
 #error "FEATURE_VALVE needs FEATURE_PRESSURE"
 #endif
@@ -86,7 +88,10 @@
 #define FILL_CHECK_MINUTES   10     // Wake interval while the valve is open
 
 // --- Sensor averaging ---
-#define NUM_MEASUREMENTS   10
+#define NUM_MEASUREMENTS   30   // max. shots per measurement
+#define SHOT_PAUSE_MS      20   // pause between shots (echo of a ~1 m target is gone after ~6 ms)
+#define MEASURE_RETRIES     3   // full measurements before reporting an error
+#define TARGET_VALID        4   // stop early once this many valid shots are collected
 
 // Valid sensor range – readings outside this window are rejected as noise.
 // Min: the JSN-SR04T never reports less than ~20 cm, even in its blind zone –
@@ -101,7 +106,7 @@
 // If fewer than MIN_AGREE shots agree, the reading is reported as unstable
 // (typical for multi-echoes when the water is too close to the sensor).
 #define SPREAD_TOL_CM       3
-#define MIN_AGREE           7
+#define MIN_AGREE           3
 
 // --- Special LoRa payload codes (must match the receiver) ---
 #define CODE_UNSTABLE     253
@@ -244,36 +249,63 @@ void updateDisplay(int fillLevel, const char* errorText, const char* status, flo
 static long echoMicros() {
     unsigned long t0 = micros();
     while (digitalRead(ECHO_PIN) == LOW) {
-        if ((micros() - t0) > 5000) {
+        if ((micros() - t0) > 3000) {
             Serial.print(" -> no rising edge");
             return 0;
         }
     }
     // Measure the HIGH pulse (50 ms max ≈ 8.5 m)
     unsigned long t1 = micros();
+    Serial.printf(" [rise after %lu us]", t1 - t0);
     while (digitalRead(ECHO_PIN) == HIGH) {
         if ((micros() - t1) > 50000) break;
     }
     return (long)(micros() - t1);
 }
 
+// Live feedback during a measurement: shot counter, valid hits and last result.
+static void showShotProgress(int shot, int valid, bool hit, float lastCm) {
+    if (!oledReady) return;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Measuring");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(0, 14);
+    display.printf("Shot %d/%d", shot, NUM_MEASUREMENTS);
+    display.setCursor(0, 34);
+    display.printf("Hits %d/%d", valid, TARGET_VALID);
+    display.setTextSize(1);
+    display.setCursor(0, 55);
+    if (hit) display.printf("last: %.1f cm", lastCm);
+    else     display.print("last: no echo");
+    display.display();
+}
+
 // Fires NUM_MEASUREMENTS shots, rejects outliers around the median and
 // writes the averaged distance to distanceCm (only valid for MEAS_OK).
 MeasureResult measureDistance(float &distanceCm) {
     float readings[NUM_MEASUREMENTS];
-    int valid = 0;
-    for (int i = 0; i < NUM_MEASUREMENTS; i++) {
+    int valid = 0, shots = 0;
+    for (int i = 0; i < NUM_MEASUREMENTS && valid < TARGET_VALID; i++) {
+        shots++;
         digitalWrite(TRIG_PIN, LOW);
         delayMicroseconds(4);
         digitalWrite(TRIG_PIN, HIGH);
-        delayMicroseconds(10);
+        delayMicroseconds(50);
         digitalWrite(TRIG_PIN, LOW);
 
         Serial.printf("  [sensor] shot %d:", i + 1);
         long duration = echoMicros();
+        bool lastValidShot = false;
+        float lastD = 0;
         if (duration > 0) {
             float d = duration * 0.034f / 2.0f;
+            lastD = d;
             if (d >= SENSOR_MIN_CM && d <= SENSOR_MAX_CM) {
+                lastValidShot = true;
                 Serial.printf(" %ld us -> %.1f cm OK", duration, d);
                 readings[valid++] = d;
             } else {
@@ -281,10 +313,11 @@ MeasureResult measureDistance(float &distanceCm) {
             }
         }
         Serial.println();
-        delay(60);
+        if (shots % 3 == 0) showShotProgress(shots, valid, duration > 0 && lastValidShot, lastD);   // OLED refresh costs ~25 ms   // no-op while the OLED is off
+        delay(SHOT_PAUSE_MS);
     }
     if (valid == 0) {
-        Serial.printf("  [sensor] valid=0/%d\n", NUM_MEASUREMENTS);
+        Serial.println("  [sensor] valid=0");
         return MEAS_NO_ECHO;
     }
 
@@ -302,8 +335,8 @@ MeasureResult measureDistance(float &distanceCm) {
             agree++;
         }
     }
-    Serial.printf("  [sensor] valid=%d/%d  median=%.1f cm  agree=%d  spread=%.1f cm\n",
-                  valid, NUM_MEASUREMENTS, median, agree, readings[valid - 1] - readings[0]);
+    Serial.printf("  [sensor] valid=%d/%d shots  median=%.1f cm  agree=%d  spread=%.1f cm\n",
+                  valid, shots, median, agree, readings[valid - 1] - readings[0]);
 
     if (median < SENSOR_BLIND_CM) return MEAS_BLIND;
     if (agree < MIN_AGREE)        return MEAS_UNSTABLE;
@@ -414,6 +447,7 @@ void goToSleep() {
 
 void setup() {
     Serial.begin(115200);
+    Serial.setTxTimeoutMs(0);   // never block when no serial monitor is attached
 
     esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
     bool buttonWakeup = (wakeReason == ESP_SLEEP_WAKEUP_EXT0);
@@ -445,8 +479,39 @@ void setup() {
     pinMode(ECHO_PIN, INPUT_PULLDOWN);
     delay(200);
 
+#if DEBUG_CONTINUOUS
+    // Debug: measure forever, show on OLED + Serial, no LoRa, no deep sleep
+    initOLED();
+    while (true) {
+        float d = 0;
+        updateDisplay(-1, nullptr, "Measuring...");
+        unsigned long t0 = millis();
+        MeasureResult m = measureDistance(d);
+        Serial.printf("  [sensor] took %lu ms\n", millis() - t0);
+        const char* names[] = { "OK", "NO_ECHO", "BLIND", "UNSTABLE" };
+        char line[24];
+        if (m == MEAS_OK) {
+            int f = calcFillLevel(d);
+            Serial.printf(">>> %s  dist=%.1f cm  fill=%d%%\n", names[m], d, f);
+            snprintf(line, sizeof(line), "Dist: %.1f cm", d);
+            updateDisplay(f, nullptr, line);
+        } else {
+            Serial.printf(">>> %s\n", names[m]);
+            updateDisplay(-1, m == MEAS_BLIND ? "FULL!" : (m == MEAS_UNSTABLE ? "Unstable" : "No echo"), "Debug mode");
+        }
+        delay(500);
+    }
+#endif
+
     float         distance  = 0;
-    MeasureResult meas      = measureDistance(distance);
+    MeasureResult meas      = MEAS_NO_ECHO;
+    // Weak echoes are common with this sensor → retry a few times before giving up
+    for (int attempt = 1; attempt <= MEASURE_RETRIES; attempt++) {
+        meas = measureDistance(distance);
+        if (meas == MEAS_OK || meas == MEAS_BLIND) break;
+        Serial.printf("Measurement attempt %d/%d failed, retrying...\n", attempt, MEASURE_RETRIES);
+        delay(500);
+    }
     int           fillLevel = 0;
     int           payload   = CODE_SENSOR_ERROR;
     const char*   errorText = nullptr;
