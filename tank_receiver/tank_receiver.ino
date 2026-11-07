@@ -91,6 +91,12 @@
 #define CODE_TANK_FULL    254   // Water within the sensor's blind zone
 #define CODE_SENSOR_ERROR 255   // No valid echo at all
 
+// --- LoRa preamble (must match on both boards) ---
+// The sender transmits a long preamble so the receiver can run its radio in
+// RX duty-cycle mode (sleep most of the time, briefly listen for a preamble)
+// instead of staying in continuous RX (~5 mA).
+#define LORA_PREAMBLE_SYMBOLS  512   // ≈ 0.52 s airtime at SF7 / 125 kHz
+
 // --- Battery ADC (Heltec V4: ~390k/100k divider (x4.9) on GPIO 1, enable via GPIO 37) ---
 #define BAT_ADC_PIN   1
 #define BAT_CTRL_PIN  37
@@ -132,18 +138,38 @@ float readBatteryVoltage() {
     digitalWrite(BAT_CTRL_PIN, HIGH);
     delay(10);
     long sum = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 16; i++) {
         sum += analogReadMilliVolts(BAT_ADC_PIN);
-        delay(5);
+        delay(2);
     }
     digitalWrite(BAT_CTRL_PIN, LOW);
-    return (sum / 8.0f / 1000.0f) * BAT_DIVIDER;
+    return (sum / 16.0f / 1000.0f) * BAT_DIVIDER;
 }
 
+// LiPo discharge curve (resting voltage → state of charge). A LiPo is far from
+// linear: it sits on a long plateau around 3.7–3.9 V and only falls off steeply
+// at the very top and bottom. Values between table points are interpolated.
+// 0 % is set to 3.27 V (practical cut-off, the protection PCB trips lower).
+static const float BAT_CURVE[][2] = {   // { volts, percent }
+    {4.20f, 100}, {4.15f, 95}, {4.11f, 90}, {4.08f, 85}, {4.02f, 80},
+    {3.98f,  75}, {3.95f, 70}, {3.91f, 65}, {3.87f, 60}, {3.85f, 55},
+    {3.84f,  50}, {3.82f, 45}, {3.80f, 40}, {3.79f, 35}, {3.77f, 30},
+    {3.75f,  25}, {3.73f, 20}, {3.71f, 15}, {3.69f, 10}, {3.61f,  5},
+    {3.27f,   0},
+};
+
 int batteryPercent(float v) {
-    // LiPo: 3.0 V = 0 %, 4.2 V = 100 %
-    float pct = (v - 3.0f) / (4.2f - 3.0f) * 100.0f;
-    return (int)constrain(pct, 0.0f, 100.0f);
+    const int n = sizeof(BAT_CURVE) / sizeof(BAT_CURVE[0]);
+    if (v >= BAT_CURVE[0][0])     return 100;
+    if (v <= BAT_CURVE[n - 1][0]) return 0;
+    for (int i = 1; i < n; i++) {
+        if (v >= BAT_CURVE[i][0]) {
+            float span = BAT_CURVE[i - 1][0] - BAT_CURVE[i][0];
+            float frac = (v - BAT_CURVE[i][0]) / span;
+            return (int)roundf(BAT_CURVE[i][1] + frac * (BAT_CURVE[i - 1][1] - BAT_CURVE[i][1]));
+        }
+    }
+    return 0;
 }
 
 // ============================================
@@ -362,7 +388,10 @@ void goToSleep() {
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, HIGH);
 
-    radio.startReceive();
+    // RX duty cycle: the SX1262 sleeps and only wakes briefly to look for the
+    // sender's long preamble (~1-2 % duty instead of continuous RX).
+    // DIO1 still goes HIGH on a received packet and wakes the ESP32.
+    radio.startReceiveDutyCycleAuto(LORA_PREAMBLE_SYMBOLS, 8);
 
 #ifdef LORA_PA_EN
     rtc_gpio_hold_en((gpio_num_t)LORA_PA_EN);
@@ -399,7 +428,7 @@ void handleLoRaWakeup() {
     int rssi    = (int)radio.getRSSI();
 
     radio.begin(868.0, 125.0, 7, 5);
-    radio.transmit("ACK");
+    if (rxState == RADIOLIB_ERR_NONE) radio.transmit("ACK");   // no TX burst for spurious wakeups
 
     if (rxState == RADIOLIB_ERR_NONE) {
         received.trim();
@@ -579,6 +608,7 @@ void handleFirstBoot() {
 // ============================================
 
 void setup() {
+    setCpuFrequencyMhz(80);   // plenty for LoRa + WiFi, noticeably less active current
     auto cause = esp_sleep_get_wakeup_cause();
 
     switch (cause) {
