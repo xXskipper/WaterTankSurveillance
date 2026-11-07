@@ -19,7 +19,8 @@ Both boards spend almost all of their time in deep sleep.
 
 - Fill level in % via a JSN-SR04T waterproof ultrasonic sensor (median filter, outlier rejection, blind-zone detection)
 - Measurement every 30 minutes, deep sleep in between, designed for a LiPo plus a small solar panel
-- Receiver sleeps with the SX1262 in continuous RX and is woken by the incoming packet (no polling)
+- Receiver sleeps while the SX1262 runs in RX duty-cycle mode (the sender transmits a long preamble) and is woken by the incoming packet (no polling) – ~30× less current than continuous RX
+- Battery percentage uses a LiPo discharge curve (non-linear), not a straight line
 - E-mail when the level drops below a threshold, and once when the tank is full (with hysteresis, no repeat spam)
 - OLED status on button press (level, battery, link quality, WiFi); long press sends a test e-mail
 - Optional pressure monitoring and automatic refill valve with several safety limits
@@ -93,6 +94,8 @@ Plain text, sent by the sender every wake-up:
 45            fill level in % (FEATURE_PRESSURE off)
 45;3.2;1      level;pressure in bar;valve  (valve: 0 closed, 1 open, 2 locked)
 ```
+
+Both boards must use the same `LORA_PREAMBLE_SYMBOLS` (sender transmits a long preamble, receiver duty-cycles its radio) – flash both after changing it.
 
 Special level codes: `253` unstable reading (ignored), `254` tank full, `255` sensor error. The receiver answers every packet with `ACK`.
 
