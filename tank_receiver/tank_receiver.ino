@@ -388,10 +388,8 @@ void goToSleep() {
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, HIGH);
 
-    // RX duty cycle: the SX1262 sleeps and only wakes briefly to look for the
-    // sender's long preamble (~1-2 % duty instead of continuous RX).
-    // DIO1 still goes HIGH on a received packet and wakes the ESP32.
-    radio.startReceiveDutyCycleAuto(LORA_PREAMBLE_SYMBOLS, 8);
+    // TEST: continuous RX (instead of RX duty cycle) to check the link
+    radio.startReceive();
 
 #ifdef LORA_PA_EN
     rtc_gpio_hold_en((gpio_num_t)LORA_PA_EN);
@@ -428,7 +426,7 @@ void handleLoRaWakeup() {
     int rssi    = (int)radio.getRSSI();
 
     radio.begin(868.0, 125.0, 7, 5);
-    if (rxState == RADIOLIB_ERR_NONE) radio.transmit("ACK");   // no TX burst for spurious wakeups
+    radio.transmit("ACK");
 
     if (rxState == RADIOLIB_ERR_NONE) {
         received.trim();
@@ -608,7 +606,6 @@ void handleFirstBoot() {
 // ============================================
 
 void setup() {
-    setCpuFrequencyMhz(80);   // plenty for LoRa + WiFi, noticeably less active current
     auto cause = esp_sleep_get_wakeup_cause();
 
     switch (cause) {

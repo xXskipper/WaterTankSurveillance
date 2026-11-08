@@ -581,7 +581,6 @@ void setup() {
     int  loraState = radio.begin(868.0, 125.0, 7, 5);
     bool loraOk    = (loraState == RADIOLIB_ERR_NONE);
     if (!loraOk) Serial.printf("LoRa init failed: %d\n", loraState);
-    else radio.setPreambleLength(LORA_PREAMBLE_SYMBOLS);   // long preamble for the duty-cycling receiver
 
     bool        txOk        = false;
     bool        linked      = false;
